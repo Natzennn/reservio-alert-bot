@@ -8,12 +8,11 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MS || 120000);
 const WEEKS_AHEAD = Number(process.env.WEEKS_AHEAD || 8);
 
-// true = przy starcie wyśle wszystkie aktualnie znalezione terminy
-// false = przy starcie tylko je zapamięta, a potem wyśle wyłącznie nowe
+// true = przy starcie wyśle aktualnie znalezione terminy
 const NOTIFY_ON_START = process.env.NOTIFY_ON_START !== "false";
 
-// true = wyśle debug na Telegram i do logów
-const DEBUG_MODE = process.env.DEBUG_MODE !== "false";
+// true = pomija terminy z tekstem "Pełne obłożenie"
+const ONLY_AVAILABLE = process.env.ONLY_AVAILABLE !== "false";
 
 if (!TELEGRAM_BOT_TOKEN) {
   throw new Error("Brakuje TELEGRAM_BOT_TOKEN w zmiennych środowiskowych.");
@@ -43,18 +42,14 @@ async function sendTelegram(message) {
   }
 }
 
-function normalizeText(text) {
-  return String(text || "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function getEventKey(event) {
-  return `${event.title}::${event.url}`;
+function normalizeText(text) {
+  return String(text || "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function escapeHtml(text) {
@@ -64,240 +59,116 @@ function escapeHtml(text) {
     .replaceAll(">", "&gt;");
 }
 
-function chunkText(text, maxLength = 3500) {
-  const chunks = [];
-  let current = String(text || "");
-
-  while (current.length > 0) {
-    chunks.push(current.slice(0, maxLength));
-    current = current.slice(maxLength);
-  }
-
-  return chunks;
+function getEventKey(event) {
+  return `${event.week}::${event.title}::${event.url}`;
 }
 
 async function scrapeCurrentPageEvents(page) {
-  const events = await page.evaluate(() => {
+  const pageUrl = page.url();
+
+  const data = await page.evaluate((onlyAvailable) => {
     function clean(text) {
       return (text || "").replace(/\s+/g, " ").trim();
     }
 
+    const bodyText = clean(document.body.innerText || "");
+
+    const weekMatch = bodyText.match(
+      /[a-ząćęłńóśźż]+ \d{1,2}, \d{4} - [a-ząćęłńóśźż]+ \d{1,2}, \d{4}/i
+    );
+
+    const week = weekMatch ? weekMatch[0] : "";
+
+    const elements = Array.from(
+      document.querySelectorAll("a, button, article, [role='button'], div, li")
+    );
+
     const results = [];
 
-    const selectors = [
-      'a[href*="/events/"]',
-      'a[href*="/event/"]',
-      'a[href*="/booking"]',
-      '[data-testid*="event"]',
-      '[class*="event"]',
-      '[class*="Event"]',
-      '[class*="calendar"]',
-      '[class*="Calendar"]',
-      '[class*="booking"]',
-      '[class*="Booking"]',
-      "article",
-      "button"
-    ];
-
-    const elements = Array.from(document.querySelectorAll(selectors.join(",")));
-
     for (const el of elements) {
-      const text = clean(el.innerText || el.textContent);
-      if (!text || text.length < 8) continue;
+      const text = clean(el.innerText || el.textContent || "");
+      if (!text) continue;
 
-      const href = el.href || window.location.href;
       const lower = text.toLowerCase();
 
-      const looksLikeEvent =
+      const hasTime = /\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}/.test(text);
+
+      const looksLikeTraining =
         lower.includes("trening") ||
         lower.includes("piro") ||
         lower.includes("idpa") ||
-        lower.includes("rezerw") ||
-        lower.includes("zarezerwuj") ||
-        lower.includes("wolne") ||
-        lower.includes("miejsc") ||
-        lower.includes("available") ||
-        lower.includes("book") ||
-        lower.includes("spots") ||
-        lower.includes("capacity") ||
-        /\d{1,2}:\d{2}/.test(text) ||
-        /\d{1,2}\.\d{1,2}/.test(text);
+        lower.includes("pistolet") ||
+        lower.includes("strzeleck");
 
-      if (!looksLikeEvent) continue;
+      if (!hasTime || !looksLikeTraining) continue;
+
+      // Pomijamy duże kontenery tygodnia, które zawierają kilka wydarzeń naraz
+      if (text.length > 260) continue;
+
+      const isFull =
+        lower.includes("pełne obłożenie") ||
+        lower.includes("pelne oblozenie") ||
+        lower.includes("fully booked") ||
+        lower.includes("brak miejsc");
+
+      if (onlyAvailable && isFull) continue;
+
+      let href = "";
+
+      if (el.href) {
+        href = el.href;
+      } else {
+        const link = el.querySelector("a[href]");
+        href = link ? link.href : window.location.href;
+      }
 
       results.push({
+        week,
         title: text,
-        url: href
+        url: href,
+        isFull
       });
     }
 
     const unique = new Map();
 
     for (const item of results) {
-      unique.set(`${item.title}::${item.url}`, item);
+      unique.set(`${item.week}::${item.title}::${item.url}`, item);
     }
 
     return Array.from(unique.values());
-  });
+  }, ONLY_AVAILABLE);
 
-  return events
-    .map((event) => ({
-      title: normalizeText(event.title),
-      url: event.url
-    }))
-    .filter((event) => event.title.length > 0);
+  return data.map((event) => ({
+    week: normalizeText(event.week),
+    title: normalizeText(event.title),
+    url: event.url || pageUrl,
+    isFull: Boolean(event.isFull)
+  }));
 }
 
-async function getVisiblePageDebug(page) {
-  return await page.evaluate(() => {
-    function clean(text) {
-      return (text || "").replace(/\s+/g, " ").trim();
-    }
+async function goToNextWeek(page) {
+  const nextHref = await page
+    .locator('a[aria-label="Przyszły tydzień"], a[aria-label*="Przyszły"], a[href*="week="]')
+    .first()
+    .getAttribute("href")
+    .catch(() => null);
 
-    const buttonsAndLinks = Array.from(document.querySelectorAll("button, a"))
-      .map((el, index) => {
-        const rect = el.getBoundingClientRect();
-        const text = clean(el.innerText || el.textContent);
-        const aria = el.getAttribute("aria-label") || "";
-        const title = el.getAttribute("title") || "";
-        const href = el.href || "";
+  if (nextHref) {
+    const absoluteUrl = new URL(nextHref, page.url()).toString();
 
-        return {
-          index,
-          text,
-          aria,
-          title,
-          href,
-          x: Math.round(rect.x),
-          y: Math.round(rect.y),
-          width: Math.round(rect.width),
-          height: Math.round(rect.height),
-          visible:
-            rect.width > 0 &&
-            rect.height > 0 &&
-            window.getComputedStyle(el).visibility !== "hidden" &&
-            window.getComputedStyle(el).display !== "none"
-        };
-      })
-      .filter((item) => item.visible)
-      .slice(0, 80);
+    console.log(`Przechodzę do przyszłego tygodnia: ${absoluteUrl}`);
 
-    const bodyText = clean(document.body.innerText || document.body.textContent || "");
-
-    return {
-      url: window.location.href,
-      title: document.title,
-      bodyText: bodyText.slice(0, 6000),
-      buttonsAndLinks
-    };
-  });
-}
-
-async function clickNextWeek(page) {
-  const possibleSelectors = [
-    'button[aria-label*="Next"]',
-    'button[aria-label*="next"]',
-    'button[aria-label*="Następ"]',
-    'button[aria-label*="następ"]',
-    'button[aria-label*="Dalej"]',
-    'button[aria-label*="dalej"]',
-    'a[aria-label*="Next"]',
-    'a[aria-label*="next"]',
-    'a[aria-label*="Następ"]',
-    'a[aria-label*="następ"]',
-    'a[aria-label*="Dalej"]',
-    'a[aria-label*="dalej"]',
-    'button:has-text("›")',
-    'button:has-text(">")',
-    'a:has-text("›")',
-    'a:has-text(">")',
-    'button:has(svg)',
-    'a:has(svg)'
-  ];
-
-  for (const selector of possibleSelectors) {
-    const count = await page.locator(selector).count().catch(() => 0);
-
-    for (let i = 0; i < count; i++) {
-      const el = page.locator(selector).nth(i);
-
-      if (!(await el.isVisible().catch(() => false))) continue;
-
-      const box = await el.boundingBox().catch(() => null);
-      if (!box) continue;
-
-      if (box.x > 600) {
-        await el.click({ timeout: 5000 });
-        await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
-        await page.waitForTimeout(2500);
-        return true;
-      }
-    }
-  }
-
-  const clicked = await page.evaluate(() => {
-    const candidates = Array.from(document.querySelectorAll("button, a"))
-      .map((el) => {
-        const rect = el.getBoundingClientRect();
-        const text = (el.innerText || el.textContent || "").trim();
-        const aria = (el.getAttribute("aria-label") || "").trim();
-        const title = (el.getAttribute("title") || "").trim();
-
-        return {
-          el,
-          x: rect.x,
-          y: rect.y,
-          width: rect.width,
-          height: rect.height,
-          text,
-          aria,
-          title,
-          visible:
-            rect.width > 0 &&
-            rect.height > 0 &&
-            window.getComputedStyle(el).visibility !== "hidden" &&
-            window.getComputedStyle(el).display !== "none"
-        };
-      })
-      .filter((item) => item.visible)
-      .filter((item) => item.y < 350)
-      .filter((item) => item.x > window.innerWidth / 2);
-
-    const direct = candidates.find((item) => {
-      const combined = `${item.text} ${item.aria} ${item.title}`.toLowerCase();
-
-      return (
-        combined.includes("next") ||
-        combined.includes("następ") ||
-        combined.includes("dalej") ||
-        combined.includes("›") ||
-        combined.includes(">")
-      );
+    await page.goto(absoluteUrl, {
+      waitUntil: "networkidle",
+      timeout: 45000
     });
 
-    if (direct) {
-      direct.el.click();
-      return true;
-    }
-
-    const sorted = candidates
-      .filter((item) => item.width <= 120 && item.height <= 120)
-      .sort((a, b) => b.x - a.x);
-
-    if (sorted[0]) {
-      sorted[0].el.click();
-      return true;
-    }
-
-    return false;
-  });
-
-  if (clicked) {
-    await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
-    await page.waitForTimeout(2500);
+    await page.waitForTimeout(2000);
     return true;
   }
 
+  console.log("Nie znaleziono linku Przyszły tydzień.");
   return false;
 }
 
@@ -311,33 +182,29 @@ async function scrapeReservioEvents(page) {
 
   const allEvents = [];
 
-  for (let week = 0; week <= WEEKS_AHEAD; week++) {
-    console.log(`Skanuję tydzień ${week + 1}/${WEEKS_AHEAD + 1}: ${page.url()}`);
+  for (let weekIndex = 0; weekIndex <= WEEKS_AHEAD; weekIndex++) {
+    console.log(`Skanuję tydzień ${weekIndex + 1}/${WEEKS_AHEAD + 1}: ${page.url()}`);
 
     const events = await scrapeCurrentPageEvents(page);
-    console.log(`W tym tygodniu znaleziono kandydatów: ${events.length}`);
 
-    if (DEBUG_MODE) {
-      console.log(`=== WYDARZENIA WIDZIANE W TYGODNIU ${week + 1} ===`);
-      events.forEach((event, index) => {
-        console.log(`${index + 1}. ${event.title}`);
-        console.log(event.url);
-      });
-      console.log("============================================");
-    }
+    console.log(`W tym tygodniu znaleziono terminów: ${events.length}`);
+
+    events.forEach((event, index) => {
+      console.log(`${index + 1}. [${event.week}] ${event.title}`);
+      console.log(event.url);
+    });
 
     allEvents.push(...events);
 
-    if (week === WEEKS_AHEAD) break;
+    if (weekIndex === WEEKS_AHEAD) break;
 
-    const moved = await clickNextWeek(page);
+    const moved = await goToNextWeek(page);
 
     if (!moved) {
-      console.log("Nie udało się znaleźć przycisku następnego tygodnia.");
       break;
     }
 
-    await sleep(1000);
+    await sleep(700);
   }
 
   const unique = new Map();
@@ -354,11 +221,16 @@ async function notifyCurrentEventsAtStart(events) {
     `🤖 <b>Bot Reservio wystartował</b>\n\n` +
       `Strona: ${escapeHtml(RESERVIO_URL)}\n` +
       `Sprawdzam tygodni do przodu: <b>${WEEKS_AHEAD}</b>\n` +
-      `Znalezione aktualnie terminy: <b>${events.length}</b>`
+      `Tylko dostępne: <b>${ONLY_AVAILABLE ? "tak" : "nie"}</b>\n` +
+      `Znalezione terminy: <b>${events.length}</b>`
   );
 
   if (events.length === 0) {
-    await sendTelegram("Brak aktualnie widocznych terminów.");
+    await sendTelegram(
+      `Brak aktualnie dostępnych terminów.\n\n` +
+        `Jeżeli chcesz widzieć też pełne terminy, ustaw w Railway:\n` +
+        `<code>ONLY_AVAILABLE=false</code>`
+    );
     return;
   }
 
@@ -367,50 +239,11 @@ async function notifyCurrentEventsAtStart(events) {
 
     await sendTelegram(
       `📌 <b>Termin dostępny teraz</b> (${i + 1}/${events.length})\n\n` +
+        `<b>${escapeHtml(event.week)}</b>\n\n` +
         `${escapeHtml(event.title)}\n\n` +
         `🔗 ${escapeHtml(event.url)}`
     );
 
-    await sleep(400);
-  }
-}
-
-async function sendDebugToTelegram(page, events) {
-  if (!DEBUG_MODE) return;
-
-  const debug = await getVisiblePageDebug(page);
-
-  const eventList = events
-    .map((event, index) => `${index + 1}. ${escapeHtml(event.title)}\n${escapeHtml(event.url)}`)
-    .join("\n\n");
-
-  await sendTelegram(
-    `🔍 <b>DEBUG Reservio</b>\n\n` +
-      `Bot widzi wydarzeń: <b>${events.length}</b>\n` +
-      `URL: ${escapeHtml(debug.url)}\n` +
-      `Tytuł strony: ${escapeHtml(debug.title)}\n\n` +
-      `${eventList || "Brak wydarzeń"}`
-  );
-
-  const buttonsText = debug.buttonsAndLinks
-    .map((item) => {
-      return (
-        `#${item.index} x:${item.x} y:${item.y} w:${item.width} h:${item.height}\n` +
-        `text: ${item.text || "-"}\n` +
-        `aria: ${item.aria || "-"}\n` +
-        `title: ${item.title || "-"}\n` +
-        `href: ${item.href || "-"}`
-      );
-    })
-    .join("\n\n");
-
-  for (const chunk of chunkText(buttonsText, 3200).slice(0, 2)) {
-    await sendTelegram(`🔘 <b>DEBUG przyciski/linki</b>\n\n<pre>${escapeHtml(chunk)}</pre>`);
-    await sleep(400);
-  }
-
-  for (const chunk of chunkText(debug.bodyText, 3200).slice(0, 2)) {
-    await sendTelegram(`📄 <b>DEBUG tekst strony</b>\n\n<pre>${escapeHtml(chunk)}</pre>`);
     await sleep(400);
   }
 }
@@ -443,21 +276,12 @@ async function checkEvents() {
 
     const events = await scrapeReservioEvents(page);
 
-    console.log(`Znaleziono łącznie wydarzeń/kandydatów: ${events.length}`);
-
-    console.log("=== WSZYSTKIE WYDARZENIA WIDZIANE PRZEZ BOTA ===");
-    events.forEach((event, index) => {
-      console.log(`${index + 1}. ${event.title}`);
-      console.log(event.url);
-    });
-    console.log("================================================");
+    console.log(`Znaleziono łącznie terminów: ${events.length}`);
 
     if (firstRun) {
       for (const event of events) {
         knownEvents.add(getEventKey(event));
       }
-
-      await sendDebugToTelegram(page, events);
 
       if (NOTIFY_ON_START) {
         await notifyCurrentEventsAtStart(events);
@@ -482,10 +306,13 @@ async function checkEvents() {
 
     for (const event of newEvents) {
       await sendTelegram(
-        `🚨 <b>Nowy termin / wydarzenie w Reservio</b>\n\n` +
+        `🚨 <b>Nowy dostępny termin w Reservio</b>\n\n` +
+          `<b>${escapeHtml(event.week)}</b>\n\n` +
           `${escapeHtml(event.title)}\n\n` +
           `🔗 ${escapeHtml(event.url)}`
       );
+
+      await sleep(400);
     }
 
     if (newEvents.length > 0) {
@@ -514,7 +341,7 @@ async function main() {
   console.log(`CHECK_INTERVAL_MS=${CHECK_INTERVAL_MS}`);
   console.log(`RESERVIO_URL=${RESERVIO_URL}`);
   console.log(`NOTIFY_ON_START=${NOTIFY_ON_START}`);
-  console.log(`DEBUG_MODE=${DEBUG_MODE}`);
+  console.log(`ONLY_AVAILABLE=${ONLY_AVAILABLE}`);
 
   await checkEvents();
 
