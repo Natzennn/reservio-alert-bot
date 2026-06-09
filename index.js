@@ -1,7 +1,7 @@
 const { chromium } = require("playwright");
 const TelegramBot = require("node-telegram-bot-api");
 
-const RESERVIO_URL = process.env.RESERVIO_URL || "https://test1874.reservio.com/events";
+const RESERVIO_URL = process.env.RESERVIO_URL || "https://ttsd.reservio.com/events";
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
@@ -19,7 +19,11 @@ let browser;
 let isChecking = false;
 
 async function sendTelegram(message) {
-  await bot.sendMessage(TELEGRAM_CHAT_ID, message, { parse_mode: "HTML", disable_web_page_preview: false });
+  try {
+    await bot.sendMessage(TELEGRAM_CHAT_ID, message, { parse_mode: "HTML", disable_web_page_preview: false });
+  } catch (err) {
+    console.error("Błąd wysyłki Telegram:", err.message);
+  }
 }
 
 function normalizeText(text) {
@@ -152,7 +156,7 @@ async function checkEvents() {
 
     if (firstRun) {
       for (const event of events) knownEvents.add(getEventKey(event));
-      if (NOTIFY_ON_START) await sendTelegram(`🤖 Bot wystartował. ${events.length} wydarzeń.`);
+      if (NOTIFY_ON_START) await sendTelegram(`✅ Bot wystartował. Znaleziono aktualnie ${events.length} wydarzeń.`);
       firstRun = false;
       return;
     }
@@ -179,7 +183,10 @@ async function main() {
   console.log(`WEEKS_AHEAD=${WEEKS_AHEAD}`);
   console.log(`CHECK_INTERVAL_MS=${CHECK_INTERVAL_MS}`);
   console.log(`RESERVIO_URL=${RESERVIO_URL}`);
+
+  await sendTelegram("✅ Bot wystartował i działa poprawnie."); // test alert przy starcie
   await checkEvents();
+
   setInterval(async()=>{ await checkEvents(); }, CHECK_INTERVAL_MS);
 }
 
