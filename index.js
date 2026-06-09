@@ -1,7 +1,7 @@
 const { chromium } = require("playwright");
 const TelegramBot = require("node-telegram-bot-api");
 
-const RESERVIO_URL = process.env.RESERVIO_URL || "https://ttsd.reservio.com/events";
+const RESERVIO_URL = process.env.RESERVIO_URL || "https://test1874.reservio.com/events";
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
@@ -11,6 +11,9 @@ const WEEKS_AHEAD = Number(process.env.WEEKS_AHEAD || 8);
 // true = przy starcie wyśle wszystkie aktualnie znalezione terminy
 // false = przy starcie tylko je zapamięta, a potem wyśle wyłącznie nowe
 const NOTIFY_ON_START = process.env.NOTIFY_ON_START !== "false";
+
+// true = wyśle debug na Telegram i do logów
+const DEBUG_MODE = process.env.DEBUG_MODE !== "false";
 
 if (!TELEGRAM_BOT_TOKEN) {
   throw new Error("Brakuje TELEGRAM_BOT_TOKEN w zmiennych środowiskowych.");
@@ -61,6 +64,18 @@ function escapeHtml(text) {
     .replaceAll(">", "&gt;");
 }
 
+function chunkText(text, maxLength = 3500) {
+  const chunks = [];
+  let current = String(text || "");
+
+  while (current.length > 0) {
+    chunks.push(current.slice(0, maxLength));
+    current = current.slice(maxLength);
+  }
+
+  return chunks;
+}
+
 async function scrapeCurrentPageEvents(page) {
   const events = await page.evaluate(() => {
     function clean(text) {
@@ -76,6 +91,10 @@ async function scrapeCurrentPageEvents(page) {
       '[data-testid*="event"]',
       '[class*="event"]',
       '[class*="Event"]',
+      '[class*="calendar"]',
+      '[class*="Calendar"]',
+      '[class*="booking"]',
+      '[class*="Booking"]',
       "article",
       "button"
     ];
@@ -99,7 +118,10 @@ async function scrapeCurrentPageEvents(page) {
         lower.includes("miejsc") ||
         lower.includes("available") ||
         lower.includes("book") ||
-        /\d{1,2}:\d{2}/.test(text);
+        lower.includes("spots") ||
+        lower.includes("capacity") ||
+        /\d{1,2}:\d{2}/.test(text) ||
+        /\d{1,2}\.\d{1,2}/.test(text);
 
       if (!looksLikeEvent) continue;
 
@@ -124,6 +146,51 @@ async function scrapeCurrentPageEvents(page) {
       url: event.url
     }))
     .filter((event) => event.title.length > 0);
+}
+
+async function getVisiblePageDebug(page) {
+  return await page.evaluate(() => {
+    function clean(text) {
+      return (text || "").replace(/\s+/g, " ").trim();
+    }
+
+    const buttonsAndLinks = Array.from(document.querySelectorAll("button, a"))
+      .map((el, index) => {
+        const rect = el.getBoundingClientRect();
+        const text = clean(el.innerText || el.textContent);
+        const aria = el.getAttribute("aria-label") || "";
+        const title = el.getAttribute("title") || "";
+        const href = el.href || "";
+
+        return {
+          index,
+          text,
+          aria,
+          title,
+          href,
+          x: Math.round(rect.x),
+          y: Math.round(rect.y),
+          width: Math.round(rect.width),
+          height: Math.round(rect.height),
+          visible:
+            rect.width > 0 &&
+            rect.height > 0 &&
+            window.getComputedStyle(el).visibility !== "hidden" &&
+            window.getComputedStyle(el).display !== "none"
+        };
+      })
+      .filter((item) => item.visible)
+      .slice(0, 80);
+
+    const bodyText = clean(document.body.innerText || document.body.textContent || "");
+
+    return {
+      url: window.location.href,
+      title: document.title,
+      bodyText: bodyText.slice(0, 6000),
+      buttonsAndLinks
+    };
+  });
 }
 
 async function clickNextWeek(page) {
@@ -250,6 +317,15 @@ async function scrapeReservioEvents(page) {
     const events = await scrapeCurrentPageEvents(page);
     console.log(`W tym tygodniu znaleziono kandydatów: ${events.length}`);
 
+    if (DEBUG_MODE) {
+      console.log(`=== WYDARZENIA WIDZIANE W TYGODNIU ${week + 1} ===`);
+      events.forEach((event, index) => {
+        console.log(`${index + 1}. ${event.title}`);
+        console.log(event.url);
+      });
+      console.log("============================================");
+    }
+
     allEvents.push(...events);
 
     if (week === WEEKS_AHEAD) break;
@@ -299,6 +375,46 @@ async function notifyCurrentEventsAtStart(events) {
   }
 }
 
+async function sendDebugToTelegram(page, events) {
+  if (!DEBUG_MODE) return;
+
+  const debug = await getVisiblePageDebug(page);
+
+  const eventList = events
+    .map((event, index) => `${index + 1}. ${escapeHtml(event.title)}\n${escapeHtml(event.url)}`)
+    .join("\n\n");
+
+  await sendTelegram(
+    `🔍 <b>DEBUG Reservio</b>\n\n` +
+      `Bot widzi wydarzeń: <b>${events.length}</b>\n` +
+      `URL: ${escapeHtml(debug.url)}\n` +
+      `Tytuł strony: ${escapeHtml(debug.title)}\n\n` +
+      `${eventList || "Brak wydarzeń"}`
+  );
+
+  const buttonsText = debug.buttonsAndLinks
+    .map((item) => {
+      return (
+        `#${item.index} x:${item.x} y:${item.y} w:${item.width} h:${item.height}\n` +
+        `text: ${item.text || "-"}\n` +
+        `aria: ${item.aria || "-"}\n` +
+        `title: ${item.title || "-"}\n` +
+        `href: ${item.href || "-"}`
+      );
+    })
+    .join("\n\n");
+
+  for (const chunk of chunkText(buttonsText, 3200).slice(0, 2)) {
+    await sendTelegram(`🔘 <b>DEBUG przyciski/linki</b>\n\n<pre>${escapeHtml(chunk)}</pre>`);
+    await sleep(400);
+  }
+
+  for (const chunk of chunkText(debug.bodyText, 3200).slice(0, 2)) {
+    await sendTelegram(`📄 <b>DEBUG tekst strony</b>\n\n<pre>${escapeHtml(chunk)}</pre>`);
+    await sleep(400);
+  }
+}
+
 async function checkEvents() {
   if (isChecking) {
     console.log("Poprzednie sprawdzanie jeszcze trwa — pomijam ten cykl.");
@@ -329,10 +445,19 @@ async function checkEvents() {
 
     console.log(`Znaleziono łącznie wydarzeń/kandydatów: ${events.length}`);
 
+    console.log("=== WSZYSTKIE WYDARZENIA WIDZIANE PRZEZ BOTA ===");
+    events.forEach((event, index) => {
+      console.log(`${index + 1}. ${event.title}`);
+      console.log(event.url);
+    });
+    console.log("================================================");
+
     if (firstRun) {
       for (const event of events) {
         knownEvents.add(getEventKey(event));
       }
+
+      await sendDebugToTelegram(page, events);
 
       if (NOTIFY_ON_START) {
         await notifyCurrentEventsAtStart(events);
@@ -389,6 +514,7 @@ async function main() {
   console.log(`CHECK_INTERVAL_MS=${CHECK_INTERVAL_MS}`);
   console.log(`RESERVIO_URL=${RESERVIO_URL}`);
   console.log(`NOTIFY_ON_START=${NOTIFY_ON_START}`);
+  console.log(`DEBUG_MODE=${DEBUG_MODE}`);
 
   await checkEvents();
 
